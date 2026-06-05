@@ -38,6 +38,23 @@ class BeforeSummarizationHook(Protocol):
     def __call__(self, event: SummarizationEvent) -> None: ...
 
 
+def _is_tool_output_synopsis(msg: AnyMessage) -> bool:
+    """Return True when *msg* is a ToolMessage holding a synopsis preview.
+
+    ToolOutputBudget replaces oversized tool results with a structured synopsis
+    whose first line always reads ``[Full <tool> output saved to <path> …]``.
+    When summarization compresses these messages, the file path is lost and the
+    externalized file becomes an unreachable orphan.
+    """
+    if not isinstance(msg, ToolMessage):
+        return False
+    content = str(getattr(msg, "content", ""))
+    if not content:
+        return False
+    # Match the canonical opening line injected by render_tool_output_preview.
+    return content.startswith("[Full ") and "output saved to" in content
+
+
 def _resolve_thread_id(runtime: Runtime) -> str | None:
     """Resolve the current thread ID from runtime context or LangGraph config."""
     thread_id = runtime.context.get("thread_id") if runtime.context else None
@@ -137,8 +154,10 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
         messages_to_summarize, preserved_messages = self._partition_with_skill_rescue(messages, cutoff_index)
         messages_to_summarize, preserved_messages = self._preserve_dynamic_context_reminders(messages_to_summarize, preserved_messages)
+        messages_to_summarize, preserved_messages = self._preserve_tool_output_synopses(messages_to_summarize, preserved_messages)
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
         summary = self._create_summary(messages_to_summarize)
+        new_messages = self._build_new_messages(summary)
         new_messages = self._build_new_messages(summary)
 
         return {
@@ -163,6 +182,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
         messages_to_summarize, preserved_messages = self._partition_with_skill_rescue(messages, cutoff_index)
         messages_to_summarize, preserved_messages = self._preserve_dynamic_context_reminders(messages_to_summarize, preserved_messages)
+        messages_to_summarize, preserved_messages = self._preserve_tool_output_synopses(messages_to_summarize, preserved_messages)
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
         summary = await self._acreate_summary(messages_to_summarize)
         new_messages = self._build_new_messages(summary)
@@ -199,6 +219,24 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
 
         remaining = [msg for msg in messages_to_summarize if not is_dynamic_context_reminder(msg)]
         return remaining, reminders + preserved_messages
+
+    def _preserve_tool_output_synopses(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        preserved_messages: list[AnyMessage],
+    ) -> tuple[list[AnyMessage], list[AnyMessage]]:
+        """Keep tool-output synopsis ToolMessages out of summary compression.
+
+        These synopses contain the file path needed to access externalized tool
+        output.  When summarization removes them the persisted file becomes an
+        orphan the model can never reach.
+        """
+        synopses = [msg for msg in messages_to_summarize if _is_tool_output_synopsis(msg)]
+        if not synopses:
+            return messages_to_summarize, preserved_messages
+
+        remaining = [msg for msg in messages_to_summarize if not _is_tool_output_synopsis(msg)]
+        return remaining, synopses + preserved_messages
 
     def _partition_with_skill_rescue(
         self,
