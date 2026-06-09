@@ -3,15 +3,24 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain.tools import ToolRuntime
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.runtime import Runtime
 
+from deerflow.agents.thread_state import ThreadState
 from deerflow.sandbox.middleware import SandboxMiddleware
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.sandbox_provider import SandboxProvider, reset_sandbox_provider, set_sandbox_provider
 from deerflow.sandbox.search import GrepMatch
 from deerflow.sandbox.tools import ls_tool
+
+
+class _ToolCallingFakeModel(GenericFakeChatModel):
+    def bind_tools(self, tools, **kwargs):  # noqa: ANN001, ANN003
+        return self
 
 
 class _SyncProvider(SandboxProvider):
@@ -147,6 +156,47 @@ async def test_abefore_agent_delegates_to_super_when_not_acquiring(
 
     assert result == {"delegated": True}
     assert calls == [(state, runtime)]
+
+
+@pytest.mark.anyio
+async def test_default_lazy_tool_acquisition_persists_sandbox_to_graph_state() -> None:
+    provider = _AsyncOnlyProvider()
+    set_sandbox_provider(provider)
+    try:
+        model = _ToolCallingFakeModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "ls",
+                                "args": {"description": "list workspace", "path": "/mnt/user-data/workspace"},
+                                "id": "call-1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="done"),
+                ]
+            )
+        )
+        graph = create_agent(
+            model=model,
+            tools=[ls_tool],
+            middleware=[SandboxMiddleware()],
+            state_schema=ThreadState,
+        )
+
+        result = await graph.ainvoke(
+            {"messages": [HumanMessage(content="list workspace")]},
+            config={"configurable": {"thread_id": "thread-lazy"}},
+        )
+    finally:
+        reset_sandbox_provider()
+
+    assert provider.thread_ids == ["thread-lazy"]
+    assert result["sandbox"] == {"sandbox_id": "async-sandbox"}
 
 
 @pytest.mark.anyio

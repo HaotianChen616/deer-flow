@@ -1,10 +1,14 @@
 import asyncio
 import logging
-from typing import NotRequired, override
+from collections.abc import Awaitable, Callable
+from typing import Any, NotRequired, override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import ToolMessage
+from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
+from langgraph.types import Command
 
 from deerflow.agents.thread_state import SandboxState, ThreadDataState
 from deerflow.sandbox import get_sandbox_provider
@@ -126,3 +130,48 @@ class SandboxMiddleware(AgentMiddleware[SandboxMiddlewareState]):
 
         # No sandbox to release
         return await super().aafter_agent(state, runtime)
+
+    # ------------------------------------------------------------------
+    # Tool-call wrappers: persist lazy sandbox state into graph state
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _maybe_add_sandbox_update(
+        request: ToolCallRequest,
+        result: ToolMessage | Command[Any],
+    ) -> ToolMessage | Command[Any]:
+        """If a tool lazily initialized a sandbox, promote the runtime.state
+        mutation into a proper ``Command(update=...)`` so LangGraph persists it.
+
+        ``ensure_sandbox_initialized`` / ``ensure_sandbox_initialized_async``
+        write ``runtime.state["sandbox"]`` as a side-channel that is *not*
+        captured by the graph runtime.  This wrapper detects that write and
+        turns it into a formal state update.
+        """
+        sandbox_state = (request.runtime.state or {}).get("sandbox")
+        if not isinstance(sandbox_state, dict) or not sandbox_state.get("sandbox_id"):
+            return result
+
+        if isinstance(result, Command):
+            update = dict(result.update or {})
+            update.setdefault("sandbox", sandbox_state)
+            return Command(update=update)
+
+        # result is a plain ToolMessage – wrap it together with the sandbox update.
+        return Command(update={"messages": [result], "sandbox": sandbox_state})
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
+    ) -> ToolMessage | Command[Any]:
+        result = handler(request)
+        return self._maybe_add_sandbox_update(request, result)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command[Any]]],
+    ) -> ToolMessage | Command[Any]:
+        result = await handler(request)
+        return self._maybe_add_sandbox_update(request, result)
