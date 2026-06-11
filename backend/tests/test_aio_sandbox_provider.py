@@ -157,6 +157,7 @@ async def test_acquire_async_uses_async_readiness_polling(monkeypatch):
         create=MagicMock(return_value=aio_mod.SandboxInfo(sandbox_id="sandbox-async", sandbox_url="http://sandbox")),
         destroy=MagicMock(),
         discover=MagicMock(return_value=None),
+        is_alive=MagicMock(return_value=True),
     )
 
     async_readiness_calls: list[tuple[str, int]] = []
@@ -191,12 +192,12 @@ async def test_discover_or_create_with_lock_async_offloads_lock_file_open_and_cl
     )
     provider._thread_locks = {}
     provider._warm_pool = {}
-    provider._sandbox_infos = {}
+    provider._sandbox_infos = {"sandbox-async-lock": aio_mod.SandboxInfo(sandbox_id="sandbox-async-lock", sandbox_url="http://sandbox")}
     provider._thread_sandboxes = {"thread-async-lock": "sandbox-async-lock"}
     provider._sandboxes = {"sandbox-async-lock": aio_mod.AioSandbox(id="sandbox-async-lock", base_url="http://sandbox")}
     provider._last_activity = {}
     provider._lock = aio_mod.threading.Lock()
-    provider._backend = SimpleNamespace(discover=MagicMock(return_value=None))
+    provider._backend = SimpleNamespace(discover=MagicMock(return_value=None), is_alive=MagicMock(return_value=True))
 
     monkeypatch.setattr(aio_mod, "get_paths", lambda: Paths(base_dir=tmp_path))
 
@@ -434,3 +435,333 @@ def test_destroy_swallows_close_errors_and_still_destroys_backend(tmp_path, capl
 
     assert "Error closing sandbox sandbox-dest-err during destroy" in caplog.text
     provider._backend.destroy.assert_called_once()
+
+
+# ── #3474: warm pool stale-reference recovery ────────────────────────────────
+
+
+def _make_provider_with_dead_sandbox(tmp_path, sandbox_id: str, thread_id: str):
+    """Build a provider whose tracked sandbox simulates a dead container.
+
+    The fake AioSandbox raises ConnectionRefusedError on every operation,
+    matching what the real httpx client would do against a port that is no
+    longer listening (e.g. after `docker rm -f`).
+    """
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._warm_pool = {}
+    provider._thread_locks = {}
+    provider._shutdown_called = False
+    provider._idle_checker_thread = None
+    provider._config = {"replicas": 3, "idle_timeout": 600}
+    provider._backend = SimpleNamespace(
+        create=MagicMock(),
+        destroy=MagicMock(),
+        discover=MagicMock(return_value=None),
+        is_alive=MagicMock(return_value=False),
+    )
+
+    dead_sandbox = MagicMock()
+    dead_sandbox.id = sandbox_id
+    dead_sandbox.execute_command.side_effect = ConnectionRefusedError(f"[Errno 111] Connection refused: {sandbox_id}")
+    dead_sandbox.read_file.side_effect = ConnectionRefusedError(f"[Errno 111] Connection refused: {sandbox_id}")
+    dead_sandbox.write_file.side_effect = ConnectionRefusedError(f"[Errno 111] Connection refused: {sandbox_id}")
+
+    provider._sandboxes = {sandbox_id: dead_sandbox}
+    provider._sandbox_infos = {sandbox_id: aio_mod.SandboxInfo(sandbox_id=sandbox_id, sandbox_url="http://dead-host:9999")}
+    provider._thread_sandboxes = {thread_id: sandbox_id}
+    provider._last_activity = {sandbox_id: __import__("time").time()}
+    return provider, dead_sandbox, aio_mod
+
+
+def test_acquire_returns_stale_sandbox_id_without_health_check_3474(tmp_path, monkeypatch):
+    """#3474 bug 1 (fixed): acquire() must evict dead sandboxes via testOnBorrow.
+
+    When the backend reports the container is dead, acquire() must evict the
+    stale reference and fall through to discover/create instead of returning
+    the dead id.
+    """
+    provider, _dead, aio_mod = _make_provider_with_dead_sandbox(tmp_path, "deadbeef", "thread-3474")
+
+    new_info = aio_mod.SandboxInfo(sandbox_id="fresh-sandbox", sandbox_url="http://fresh:8080")
+    provider._backend.create.return_value = new_info
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda *a, **kw: True)
+
+    returned_id = provider.acquire("thread-3474")
+
+    assert returned_id != "deadbeef", "acquire must not return a dead sandbox id"
+    assert "deadbeef" not in provider._sandboxes, "dead sandbox must be evicted from _sandboxes"
+    assert "deadbeef" not in provider._sandbox_infos, "dead sandbox must be evicted from _sandbox_infos"
+
+
+def test_execute_command_raises_sandbox_connection_error_3474(tmp_path):
+    """#3474 bug 2 (fixed): AioSandbox.execute_command must raise SandboxConnectionError.
+
+    Connection failures (ConnectionRefusedError, OSError) are now propagated
+    as SandboxConnectionError instead of being swallowed into an error string.
+    This lets the provider and tool layer detect unreachable sandboxes.
+    """
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox")
+    exc_mod = importlib.import_module("deerflow.sandbox.exceptions")
+    provider, _dead, _ = _make_provider_with_dead_sandbox(tmp_path, "deadbeef", "thread-3474")
+
+    real_sandbox = aio_mod.AioSandbox.__new__(aio_mod.AioSandbox)
+    real_sandbox._id = "deadbeef"
+    real_sandbox._base_url = "http://dead-host:9999"
+    real_sandbox._home_dir = "/tmp"
+    real_sandbox._lock = aio_mod.threading.Lock()
+    real_sandbox._closed = False
+    real_sandbox._client = MagicMock()
+    real_sandbox._client.shell.exec_command.side_effect = ConnectionRefusedError("[Errno 111] Connection refused")
+
+    with pytest.raises(exc_mod.SandboxConnectionError) as exc_info:
+        real_sandbox.execute_command("ls")
+
+    assert "deadbeef" in str(exc_info.value)
+    assert exc_info.value.sandbox_id == "deadbeef"
+
+
+def test_acquire_evicts_dead_sandbox_and_creates_replacement_3474(tmp_path, monkeypatch):
+    """#3474 bug 3 (fixed): acquire() must evict dead sandboxes and create replacements.
+
+    Once the container is dead, acquire() must detect it via testOnBorrow,
+    evict the stale reference, and fall through to discover/create a new one.
+    """
+    provider, _dead, aio_mod = _make_provider_with_dead_sandbox(tmp_path, "deadbeef", "thread-3474")
+
+    new_info = aio_mod.SandboxInfo(sandbox_id="fresh-sandbox", sandbox_url="http://fresh:8080")
+    provider._backend.create.return_value = new_info
+    monkeypatch.setattr(aio_mod, "wait_for_sandbox_ready", lambda *a, **kw: True)
+
+    returned_id = provider.acquire("thread-3474")
+
+    assert returned_id != "deadbeef", "acquire must not return the dead sandbox"
+    assert "deadbeef" not in provider._sandboxes, "dead sandbox must be evicted"
+    provider._backend.create.assert_called()
+
+
+def test_is_sandbox_alive_assumes_alive_on_backend_error_3474(tmp_path):
+    """_is_sandbox_alive must assume alive when the backend itself raises.
+
+    If Docker daemon is temporarily unreachable, evicting a sandbox that may
+    still be running would create an orphan container (#3474).
+    """
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._sandbox_infos = {"sb-1": aio_mod.SandboxInfo(sandbox_id="sb-1", sandbox_url="http://host:8080")}
+    provider._backend = SimpleNamespace(is_alive=MagicMock(side_effect=RuntimeError("Docker daemon not responding")))
+
+    assert provider._is_sandbox_alive("sb-1") is True
+
+
+def test_is_sandbox_alive_returns_false_when_info_missing_3474(tmp_path):
+    """_is_sandbox_alive must return False when sandbox_infos has no entry."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._sandbox_infos = {}
+    provider._backend = SimpleNamespace(is_alive=MagicMock(return_value=True))
+
+    assert provider._is_sandbox_alive("nonexistent") is False
+    provider._backend.is_alive.assert_not_called()
+
+
+def test_evict_dead_sandbox_handles_none_sandbox_3474(tmp_path):
+    """_evict_dead_sandbox must not crash when sandbox is already gone from _sandboxes."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._sandboxes = {}
+    provider._sandbox_infos = {"gone": aio_mod.SandboxInfo(sandbox_id="gone", sandbox_url="http://gone:8080")}
+    provider._last_activity = {"gone": 0}
+    provider._warm_pool = {}
+    provider._thread_sandboxes = {"t1": "gone"}
+
+    provider._evict_dead_sandbox("gone")
+
+    assert "gone" not in provider._sandbox_infos
+    assert "gone" not in provider._last_activity
+    assert "t1" not in provider._thread_sandboxes
+
+
+def test_evict_dead_sandbox_closes_sandbox_client_3474(tmp_path):
+    """_evict_dead_sandbox must call sandbox.close() to release HTTP client resources."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    mock_sandbox = MagicMock()
+    provider._sandboxes = {"sb-1": mock_sandbox}
+    provider._sandbox_infos = {"sb-1": aio_mod.SandboxInfo(sandbox_id="sb-1", sandbox_url="http://host:8080")}
+    provider._last_activity = {"sb-1": 0}
+    provider._warm_pool = {}
+    provider._thread_sandboxes = {}
+
+    provider._evict_dead_sandbox("sb-1")
+
+    mock_sandbox.close.assert_called_once()
+    assert "sb-1" not in provider._sandboxes
+    assert "sb-1" not in provider._sandbox_infos
+
+
+def test_reclaim_warm_pool_evicts_dead_sandbox_3474(tmp_path, monkeypatch):
+    """Warm pool reclaim must evict dead containers via testOnBorrow."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._thread_locks = {}
+    provider._warm_pool = {}
+    provider._sandbox_infos = {}
+    provider._last_activity = {}
+    provider._thread_sandboxes = {}
+    provider._sandboxes = {}
+    provider._shutdown_called = False
+    provider._idle_checker_thread = None
+    provider._config = {"replicas": 3}
+    info = aio_mod.SandboxInfo(sandbox_id="warm-dead", sandbox_url="http://warm-dead:8080")
+    provider._warm_pool = {"warm-dead": (info, __import__("time").time())}
+    provider._backend = SimpleNamespace(
+        create=MagicMock(),
+        destroy=MagicMock(),
+        discover=MagicMock(return_value=None),
+        is_alive=MagicMock(return_value=False),
+    )
+
+    result = provider._reclaim_warm_pool_sandbox("thread-warm", "warm-dead")
+
+    assert result is None
+    assert "warm-dead" not in provider._sandboxes
+    assert "warm-dead" not in provider._sandbox_infos
+
+
+def test_alive_sandbox_is_not_evicted_on_acquire_3474(tmp_path):
+    """A live sandbox must be reused, not evicted."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._thread_locks = {}
+    provider._warm_pool = {}
+    provider._last_activity = {}
+    provider._shutdown_called = False
+    provider._idle_checker_thread = None
+    provider._config = {"replicas": 3}
+    live_sandbox = MagicMock()
+    live_info = aio_mod.SandboxInfo(sandbox_id="alive-sb", sandbox_url="http://alive:8080")
+    provider._sandboxes = {"alive-sb": live_sandbox}
+    provider._sandbox_infos = {"alive-sb": live_info}
+    provider._thread_sandboxes = {"thread-live": "alive-sb"}
+    provider._backend = SimpleNamespace(is_alive=MagicMock(return_value=True))
+
+    result = provider._reuse_in_process_sandbox("thread-live")
+
+    assert result == "alive-sb"
+    assert "alive-sb" in provider._sandboxes
+    live_sandbox.close.assert_not_called()
+
+
+def test_read_file_raises_sandbox_connection_error_3474():
+    """#3474 bug 2 (fixed): read_file must raise SandboxConnectionError on connection failure."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox")
+    exc_mod = importlib.import_module("deerflow.sandbox.exceptions")
+
+    real_sandbox = aio_mod.AioSandbox.__new__(aio_mod.AioSandbox)
+    real_sandbox._id = "sb-read"
+    real_sandbox._base_url = "http://dead:9999"
+    real_sandbox._home_dir = "/tmp"
+    real_sandbox._lock = aio_mod.threading.Lock()
+    real_sandbox._closed = False
+    real_sandbox._client = MagicMock()
+    real_sandbox._client.file.read_file.side_effect = ConnectionRefusedError("[Errno 111] Connection refused")
+
+    with pytest.raises(exc_mod.SandboxConnectionError) as exc_info:
+        real_sandbox.read_file("/some/path")
+
+    assert exc_info.value.sandbox_id == "sb-read"
+
+
+def test_list_dir_raises_sandbox_connection_error_3474():
+    """#3474 bug 2 (fixed): list_dir must raise SandboxConnectionError on connection failure."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox")
+    exc_mod = importlib.import_module("deerflow.sandbox.exceptions")
+
+    real_sandbox = aio_mod.AioSandbox.__new__(aio_mod.AioSandbox)
+    real_sandbox._id = "sb-list"
+    real_sandbox._base_url = "http://dead:9999"
+    real_sandbox._home_dir = "/tmp"
+    real_sandbox._lock = aio_mod.threading.Lock()
+    real_sandbox._closed = False
+    real_sandbox._client = MagicMock()
+    real_sandbox._client.shell.exec_command.side_effect = ConnectionRefusedError("[Errno 111] Connection refused")
+
+    with pytest.raises(exc_mod.SandboxConnectionError) as exc_info:
+        real_sandbox.list_dir("/some/dir")
+
+    assert exc_info.value.sandbox_id == "sb-list"
+
+
+def test_write_file_append_propagates_sandbox_connection_error_3474():
+    """#3474 bug 2 (fixed): write_file(append=True) must propagate SandboxConnectionError from read_file."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox")
+    exc_mod = importlib.import_module("deerflow.sandbox.exceptions")
+
+    real_sandbox = aio_mod.AioSandbox.__new__(aio_mod.AioSandbox)
+    real_sandbox._id = "sb-write"
+    real_sandbox._base_url = "http://dead:9999"
+    real_sandbox._home_dir = "/tmp"
+    real_sandbox._lock = aio_mod.threading.Lock()
+    real_sandbox._closed = False
+    real_sandbox._client = MagicMock()
+    real_sandbox._client.file.read_file.side_effect = ConnectionRefusedError("[Errno 111] Connection refused")
+
+    with pytest.raises(exc_mod.SandboxConnectionError):
+        real_sandbox.write_file("/some/path", "content", append=True)
+
+
+def test_destroy_tolerates_already_gone_container_3474(tmp_path):
+    """#3474 bug 3 (fixed): destroy() must not raise when the container is already gone."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._warm_pool = {}
+    provider._thread_locks = {}
+    provider._shutdown_called = False
+    provider._idle_checker_thread = None
+    provider._config = {"replicas": 3}
+    mock_sandbox = MagicMock()
+    info = aio_mod.SandboxInfo(sandbox_id="gone-sb", sandbox_url="http://gone:8080")
+    provider._sandboxes = {"gone-sb": mock_sandbox}
+    provider._sandbox_infos = {"gone-sb": info}
+    provider._thread_sandboxes = {}
+    provider._last_activity = {"gone-sb": 0}
+    provider._backend = SimpleNamespace(destroy=MagicMock(side_effect=RuntimeError("No such container: gone-sb")))
+
+    provider.destroy("gone-sb")
+
+    assert "gone-sb" not in provider._sandboxes
+    assert "gone-sb" not in provider._sandbox_infos
+    mock_sandbox.close.assert_called_once()
+
+
+def test_destroy_logs_warning_on_unexpected_error_3474(tmp_path):
+    """#3474 bug 3: destroy() must log warning but not raise on unexpected backend errors."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider = _make_provider(tmp_path)
+    provider._lock = aio_mod.threading.Lock()
+    provider._warm_pool = {}
+    provider._thread_locks = {}
+    provider._shutdown_called = False
+    provider._idle_checker_thread = None
+    provider._config = {"replicas": 3}
+    mock_sandbox = MagicMock()
+    info = aio_mod.SandboxInfo(sandbox_id="err-sb", sandbox_url="http://err:8080")
+    provider._sandboxes = {"err-sb": mock_sandbox}
+    provider._sandbox_infos = {"err-sb": info}
+    provider._thread_sandboxes = {}
+    provider._last_activity = {"err-sb": 0}
+    provider._backend = SimpleNamespace(destroy=MagicMock(side_effect=RuntimeError("Permission denied")))
+
+    provider.destroy("err-sb")
+
+    assert "err-sb" not in provider._sandboxes
+    mock_sandbox.close.assert_called_once()

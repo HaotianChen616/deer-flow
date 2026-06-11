@@ -8,6 +8,7 @@ import uuid
 from agent_sandbox import Sandbox as AioSandboxClient
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
+from deerflow.sandbox.exceptions import SandboxConnectionError
 from deerflow.sandbox.sandbox import Sandbox
 from deerflow.sandbox.search import GrepMatch, path_matches, should_ignore_path, truncate_line
 
@@ -138,9 +139,9 @@ class AioSandbox(Sandbox):
                     output = result.data.output if result.data else ""
 
                 return output if output else "(no output)"
-            except Exception as e:
-                logger.error(f"Failed to execute command in sandbox: {e}")
-                return f"Error: {e}"
+            except (ConnectionError, OSError) as e:
+                logger.error(f"Sandbox unreachable for command execution: {e}")
+                raise SandboxConnectionError(f"Sandbox {self.id} is unreachable: {e}", sandbox_id=self.id) from e
 
     def read_file(self, path: str) -> str:
         """Read the content of a file in the sandbox.
@@ -154,9 +155,9 @@ class AioSandbox(Sandbox):
         try:
             result = self._client.file.read_file(file=path)
             return result.data.content if result.data else ""
-        except Exception as e:
-            logger.error(f"Failed to read file in sandbox: {e}")
-            return f"Error: {e}"
+        except (ConnectionError, OSError) as e:
+            logger.error(f"Sandbox unreachable for file read: {e}")
+            raise SandboxConnectionError(f"Sandbox {self.id} is unreachable: {e}", sandbox_id=self.id) from e
 
     def download_file(self, path: str) -> bytes:
         """Download file bytes from the sandbox.
@@ -218,9 +219,9 @@ class AioSandbox(Sandbox):
                 if output:
                     return [line.strip() for line in output.strip().split("\n") if line.strip()]
                 return []
-            except Exception as e:
-                logger.error(f"Failed to list directory in sandbox: {e}")
-                return []
+            except (ConnectionError, OSError) as e:
+                logger.error(f"Sandbox unreachable for directory listing: {e}")
+                raise SandboxConnectionError(f"Sandbox {self.id} is unreachable: {e}", sandbox_id=self.id) from e
 
     def write_file(self, path: str, content: str, append: bool = False) -> None:
         """Write content to a file in the sandbox.
@@ -233,8 +234,13 @@ class AioSandbox(Sandbox):
         with self._lock:
             try:
                 if append:
-                    existing = self.read_file(path)
-                    if not existing.startswith("Error:"):
+                    try:
+                        existing = self.read_file(path)
+                    except SandboxConnectionError:
+                        raise
+                    except Exception:
+                        existing = ""
+                    if existing and not existing.startswith("Error:"):
                         content = existing + content
                 self._client.file.write_file(file=path, content=content)
             except Exception as e:

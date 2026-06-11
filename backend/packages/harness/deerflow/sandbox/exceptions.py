@@ -69,3 +69,18 @@ class SandboxFileNotFoundError(SandboxFileError):
     """Raised when a file or directory is not found."""
 
     pass
+
+
+class SandboxConnectionError(SandboxError):
+    """Raised when the sandbox container is unreachable.
+
+    Wraps ConnectionError / ConnectionRefusedError / OSError that indicate
+    the container has died or the network path is broken.  Inherits from
+    SandboxError so that existing ``except SandboxError`` handlers in the
+    tool layer automatically catch this (#3474).
+    """
+
+    def __init__(self, message: str = "Sandbox is unreachable", sandbox_id: str | None = None):
+        details = {"sandbox_id": sandbox_id} if sandbox_id else None
+        super().__init__(message, details)
+        self.sandbox_id = sandbox_id

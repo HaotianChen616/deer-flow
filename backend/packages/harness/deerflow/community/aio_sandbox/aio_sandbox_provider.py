@@ -459,8 +459,56 @@ class AioSandboxProvider(SandboxProvider):
         """Return deterministic IDs for thread sandboxes and random IDs otherwise."""
         return self._deterministic_sandbox_id(thread_id) if thread_id else str(uuid.uuid4())[:8]
 
+    def _is_sandbox_alive(self, sandbox_id: str) -> bool:
+        """Liveness probe using the backend's lightweight check.
+
+        Uses backend.is_alive() which checks container/Pod status without
+        making an HTTP request to the sandbox itself.  This avoids blocking
+        the event loop and does not depend on AioSandbox private attributes.
+
+        Must be called WITHOUT self._lock held (backend.is_alive may do I/O).
+        When the backend itself raises (e.g. Docker daemon unreachable) the
+        sandbox is assumed alive to avoid evicting healthy containers (#3474).
+        """
+        info = self._sandbox_infos.get(sandbox_id)
+        if info is None:
+            return False
+        try:
+            return self._backend.is_alive(info)
+        except Exception as e:
+            logger.warning(f"Sandbox {sandbox_id} liveness probe raised: {e}, assuming alive")
+            return True
+
+    def _evict_dead_sandbox(self, sandbox_id: str) -> None:
+        """Remove a known-dead sandbox from all in-process maps.
+
+        Closes the host-side HTTP client to release socket resources (#2872).
+        Does NOT call backend.destroy() — the container is already gone.
+        """
+        sandbox = None
+        with self._lock:
+            sandbox = self._sandboxes.pop(sandbox_id, None)
+            self._sandbox_infos.pop(sandbox_id, None)
+            self._last_activity.pop(sandbox_id, None)
+            self._warm_pool.pop(sandbox_id, None)
+            for tid, sid in list(self._thread_sandboxes.items()):
+                if sid == sandbox_id:
+                    del self._thread_sandboxes[tid]
+
+        if sandbox is not None:
+            try:
+                sandbox.close()
+            except Exception as e:
+                logger.warning(f"Error closing evicted sandbox {sandbox_id}: {e}")
+
     def _reuse_in_process_sandbox(self, thread_id: str | None, *, post_lock: bool = False) -> str | None:
-        """Reuse an active in-process sandbox for a thread if one is still tracked."""
+        """Reuse an active in-process sandbox for a thread if one is still tracked.
+
+        Implements testOnBorrow: before returning a cached sandbox, probes
+        the container via backend.is_alive().  If the container is dead the
+        stale reference is evicted and None is returned so the caller falls
+        through to discover/create (#3474).
+        """
         if thread_id is None:
             return None
 
@@ -469,17 +517,30 @@ class AioSandboxProvider(SandboxProvider):
                 return None
 
             existing_id = self._thread_sandboxes[thread_id]
-            if existing_id in self._sandboxes:
-                suffix = " (post-lock check)" if post_lock else ""
-                logger.info(f"Reusing in-process sandbox {existing_id} for thread {thread_id}{suffix}")
-                self._last_activity[existing_id] = time.time()
-                return existing_id
+            if existing_id not in self._sandboxes:
+                del self._thread_sandboxes[thread_id]
+                return None
 
-            del self._thread_sandboxes[thread_id]
+        if not self._is_sandbox_alive(existing_id):
+            logger.warning(f"In-process sandbox {existing_id} for thread {thread_id} is dead, evicting")
+            self._evict_dead_sandbox(existing_id)
             return None
 
+        with self._lock:
+            if existing_id not in self._sandboxes:
+                return None
+            suffix = " (post-lock check)" if post_lock else ""
+            logger.info(f"Reusing in-process sandbox {existing_id} for thread {thread_id}{suffix}")
+            self._last_activity[existing_id] = time.time()
+            return existing_id
+
     def _reclaim_warm_pool_sandbox(self, thread_id: str | None, sandbox_id: str, *, post_lock: bool = False) -> str | None:
-        """Promote a warm-pool sandbox back to active tracking if available."""
+        """Promote a warm-pool sandbox back to active tracking if available.
+
+        Implements testOnBorrow: after promoting the sandbox from the warm
+        pool, probes the container via backend.is_alive().  If the container
+        is dead the stale reference is evicted and None is returned (#3474).
+        """
         if thread_id is None:
             return None
 
@@ -493,6 +554,11 @@ class AioSandboxProvider(SandboxProvider):
             self._sandbox_infos[sandbox_id] = info
             self._last_activity[sandbox_id] = time.time()
             self._thread_sandboxes[thread_id] = sandbox_id
+
+        if not self._is_sandbox_alive(sandbox_id):
+            logger.warning(f"Warm-pool sandbox {sandbox_id} for thread {thread_id} is dead, evicting")
+            self._evict_dead_sandbox(sandbox_id)
+            return None
 
         suffix = " (post-lock check)" if post_lock else f" at {info.sandbox_url}"
         logger.info(f"Reclaimed warm-pool sandbox {sandbox_id} for thread {thread_id}{suffix}")
@@ -864,8 +930,15 @@ class AioSandboxProvider(SandboxProvider):
                 logger.warning(f"Error closing sandbox {sandbox_id} during destroy: {e}")
 
         if info:
-            self._backend.destroy(info)
-            logger.info(f"Destroyed sandbox {sandbox_id}")
+            try:
+                self._backend.destroy(info)
+                logger.info(f"Destroyed sandbox {sandbox_id}")
+            except Exception as e:
+                err = str(e).lower()
+                if "no such container" in err or "not found" in err or "404" in err:
+                    logger.info(f"Container for sandbox {sandbox_id} already gone: {e}")
+                else:
+                    logger.warning(f"Failed to destroy sandbox {sandbox_id}: {e}")
 
     def shutdown(self) -> None:
         """Shutdown all sandboxes. Thread-safe and idempotent."""

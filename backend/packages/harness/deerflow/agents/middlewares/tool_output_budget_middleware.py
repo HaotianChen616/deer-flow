@@ -172,9 +172,9 @@ def _externalize_to_sandbox(
     virtual_path = f"{virtual_dir}/{filename}"
     try:
         # AIO sandbox write_file does NOT create parent directories, so create
-        # them explicitly before writing. execute_command returns its stdout
-        # verbatim (including an "Error: ..." string on failure) rather than
-        # raising, so we cannot rely on exception propagation here.
+        # them explicitly before writing. execute_command now raises
+        # SandboxConnectionError on connection failure (#3474); the outer
+        # except Exception below handles that gracefully.
         sandbox.execute_command(f"mkdir -p {shlex.quote(virtual_dir)}")
         sandbox.write_file(virtual_path, content)
         # Validate the file landed: execute_command may have silently failed
