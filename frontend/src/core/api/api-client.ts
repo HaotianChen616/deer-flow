@@ -55,11 +55,19 @@ export function isInactiveRunStreamError(error: unknown): boolean {
   // Match the gateway's store-only run response in
   // backend/app/gateway/routers/thread_runs.py until the API exposes a
   // structured error code for inactive run streams.
-  return (
+  const is409StoreOnly =
     (status === 409 || message.includes("HTTP 409")) &&
     message.includes("not active on this worker") &&
-    message.includes("cannot be streamed")
-  );
+    message.includes("cannot be streamed");
+
+  // Match the gateway's completed-run response (HTTP 410 Gone) added for
+  // defensive join-run handling.  See fix #3 in the routing layer.
+  const is410Completed =
+    (status === 410 || message.includes("HTTP 410")) &&
+    message.includes("already completed") &&
+    message.includes("no longer available");
+
+  return is409StoreOnly || is410Completed;
 }
 
 export function clearReconnectRun(

@@ -16,7 +16,6 @@ internal checkpoint callbacks that are not exposed in the Python public API.
 from __future__ import annotations
 
 import asyncio
-import copy
 import inspect
 import logging
 import os
@@ -28,6 +27,27 @@ from langgraph.checkpoint.base import empty_checkpoint
 
 if TYPE_CHECKING:
     from langchain_core.messages import HumanMessage
+
+
+def _deepcopy_checkpoint_snapshot(
+    checkpoint: Any,
+    metadata: Any,
+    pending_writes: Any,
+) -> tuple[Any, Any, Any]:
+    """Deep-copy checkpoint components inside a thread-pool worker.
+
+    This function is designed to be called via ``asyncio.to_thread()``
+    so that large checkpoint payloads do not block the event loop.
+    The import of ``copy`` is deliberately local so the module-level
+    import can be dropped once the one remaining call site is offloaded.
+    """
+    import copy
+
+    return (
+        copy.deepcopy(checkpoint),
+        copy.deepcopy(metadata),
+        copy.deepcopy(pending_writes),
+    )
 
 from deerflow.config.app_config import AppConfig
 from deerflow.runtime.serialization import serialize
@@ -190,11 +210,22 @@ async def run_agent(
                 if ckpt_tuple is not None:
                     ckpt_config = getattr(ckpt_tuple, "config", {}).get("configurable", {})
                     pre_run_checkpoint_id = ckpt_config.get("checkpoint_id")
+                    # Offload deep-copy of large checkpoint objects to a thread pool.
+                    # Long conversation histories produce large checkpoints whose
+                    # synchronous copy.deepcopy() can block the event loop for hundreds
+                    # of milliseconds, starving other HTTP requests (health checks,
+                    # auth, etc.) and causing gateway "Apparent Death".
+                    ckpt_raw = getattr(ckpt_tuple, "checkpoint", {})
+                    meta_raw = getattr(ckpt_tuple, "metadata", {})
+                    pw_raw = getattr(ckpt_tuple, "pending_writes", []) or []
+                    ckpt_copy, meta_copy, pw_copy = await asyncio.to_thread(
+                        _deepcopy_checkpoint_snapshot, ckpt_raw, meta_raw, pw_raw
+                    )
                     pre_run_snapshot = {
                         "checkpoint_ns": ckpt_config.get("checkpoint_ns", ""),
-                        "checkpoint": copy.deepcopy(getattr(ckpt_tuple, "checkpoint", {})),
-                        "metadata": copy.deepcopy(getattr(ckpt_tuple, "metadata", {})),
-                        "pending_writes": copy.deepcopy(getattr(ckpt_tuple, "pending_writes", []) or []),
+                        "checkpoint": ckpt_copy,
+                        "metadata": meta_copy,
+                        "pending_writes": pw_copy,
                     }
             except Exception:
                 snapshot_capture_failed = True
@@ -434,7 +465,15 @@ async def run_agent(
                 logger.debug("Failed to update thread_meta status for %s (non-fatal)", thread_id)
 
         await bridge.publish_end(run_id)
+        # Schedule cleanup of both StreamBridge event buffers and RunManager RunRecord.
+        # StreamBridge is cleaned up first (after 60 s) to allow late subscribers to drain;
+        # RunManager record cleanup follows after a slightly longer delay so that status
+        # queries (e.g. POST /runs/:id/cancel with wait=true) still see the completed record.
         asyncio.create_task(bridge.cleanup(run_id, delay=60))
+        asyncio.create_task(run_manager.cleanup(run_id, delay=90))
+
+        # Release the global concurrency slot so another run can start.
+        run_manager.release_concurrency_slot(run_id)
 
 
 # ---------------------------------------------------------------------------

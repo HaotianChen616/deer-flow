@@ -5,6 +5,7 @@ import { type ReactNode } from "react";
 import { AuthProvider } from "@/core/auth/AuthProvider";
 import { getServerSideUser } from "@/core/auth/server";
 import { assertNever } from "@/core/auth/types";
+import { UnavailableLogout } from "@/components/workspace/unavailable-logout";
 
 export const dynamic = "force-dynamic";
 
@@ -30,12 +31,15 @@ export default async function AuthLayout({
           <p className="text-muted-foreground">
             Service temporarily unavailable.
           </p>
-          <Link
-            href="/login"
-            className="bg-primary text-primary-foreground hover:bg-primary/90 rounded-md px-4 py-2 text-sm"
-          >
-            Retry
-          </Link>
+          <div className="flex gap-3">
+            <Link
+              href="/login"
+              className="bg-primary text-primary-foreground hover:bg-primary/90 rounded-md px-4 py-2 text-sm"
+            >
+              Retry
+            </Link>
+            <UnavailableLogout />
+          </div>
         </div>
       );
     case "config_error":

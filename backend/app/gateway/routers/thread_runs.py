@@ -109,6 +109,26 @@ def _cancel_conflict_detail(run_id: str, record: RunRecord) -> str:
     return f"Run {run_id} is not cancellable (status: {record.status.value})"
 
 
+def _is_run_completed_and_cleaned_up(record: RunRecord) -> bool:
+    """Return True when the run has reached a terminal state and its
+    background task is no longer running, making its SSE stream unavailable.
+
+    A completed run whose task has finished (or was never started, e.g.
+    store_only) will have no active event stream.  Attempting to subscribe
+    would produce a hanging SSE connection with only heartbeats — or worse,
+    subscribe to a stream that was already cleaned up and never terminate.
+    """
+    if record.status in (RunStatus.pending, RunStatus.running):
+        return False
+    # store_only records have no task; terminal store_only runs are definitively unavailable.
+    if record.store_only:
+        return True
+    # If the record has a task field, check whether it has finished.
+    # A run whose status is terminal but whose task is still alive is
+    # still drainable (e.g. the run_agent finally block is flushing).
+    return record.task is None or record.task.done()
+
+
 def _record_to_response(record: RunRecord) -> RunResponse:
     return RunResponse(
         run_id=record.run_id,
@@ -266,6 +286,8 @@ async def join_run(thread_id: str, run_id: str, request: Request) -> StreamingRe
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     if record.store_only:
         raise HTTPException(status_code=409, detail=f"Run {run_id} is not active on this worker and cannot be streamed")
+    if _is_run_completed_and_cleaned_up(record):
+        raise HTTPException(status_code=410, detail=f"Run {run_id} has already completed and its event stream is no longer available")
 
     bridge = get_stream_bridge(request)
     return StreamingResponse(
@@ -306,6 +328,8 @@ async def stream_existing_run(
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     if record.store_only and action is None:
         raise HTTPException(status_code=409, detail=f"Run {run_id} is not active on this worker and cannot be streamed")
+    if _is_run_completed_and_cleaned_up(record):
+        raise HTTPException(status_code=410, detail=f"Run {run_id} has already completed and its event stream is no longer available")
 
     # Cancel if an action was requested (stop-button / interrupt flow)
     if action is not None:

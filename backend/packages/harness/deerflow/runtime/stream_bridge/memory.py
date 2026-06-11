@@ -33,6 +33,11 @@ class MemoryStreamBridge(StreamBridge):
         self._maxsize = queue_maxsize
         self._streams: dict[str, _RunStream] = {}
         self._counters: dict[str, int] = {}
+        # Track disposed run IDs so late subscribers don't create orphaned
+        # streams after cleanup.  Bounded to ~1000 entries to avoid unbounded
+        # growth in long-running processes.
+        self._disposed: set[str] = set()
+        self._disposed_max: int = 1024
 
     # -- helpers ---------------------------------------------------------------
 
@@ -89,6 +94,14 @@ class MemoryStreamBridge(StreamBridge):
         last_event_id: str | None = None,
         heartbeat_interval: float = 15.0,
     ) -> AsyncIterator[StreamEvent]:
+        # Defence-in-depth: if the stream was already disposed by a previous
+        # bridge.cleanup() call but the router did not reject the join, do not
+        # create a fresh (orphaned) stream that would loop on heartbeats forever.
+        # Instead, immediately yield END_SENTINEL.
+        if run_id in self._disposed:
+            yield END_SENTINEL
+            return
+
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
             next_offset = self._resolve_start_offset(stream, last_event_id)
@@ -127,7 +140,17 @@ class MemoryStreamBridge(StreamBridge):
             await asyncio.sleep(delay)
         self._streams.pop(run_id, None)
         self._counters.pop(run_id, None)
+        # Mark as disposed so late subscribers are rejected immediately.
+        # Bound the set to prevent unbounded growth.
+        if len(self._disposed) >= self._disposed_max:
+            # Discard oldest ~25% of entries (order is non-deterministic for set,
+            # but this is a safety valve, not a precise eviction policy).
+            to_discard = list(self._disposed)[: self._disposed_max // 4]
+            for rid in to_discard:
+                self._disposed.discard(rid)
+        self._disposed.add(run_id)
 
     async def close(self) -> None:
         self._streams.clear()
         self._counters.clear()
+        self._disposed.clear()

@@ -19,7 +19,6 @@ from langchain_core.messages import BaseMessage
 from langchain_core.messages.utils import convert_to_messages
 
 from app.gateway.deps import get_run_context, get_run_manager, get_stream_bridge
-from app.gateway.internal_auth import INTERNAL_SYSTEM_ROLE
 from app.gateway.utils import sanitize_log_param
 from deerflow.config.app_config import get_app_config
 from deerflow.runtime import (
@@ -31,6 +30,7 @@ from deerflow.runtime import (
     RunRecord,
     RunStatus,
     StreamBridge,
+    TooManyConcurrentRunsError,
     UnsupportedStrategyError,
     run_agent,
 )
@@ -141,14 +141,7 @@ def merge_run_context_overrides(config: dict[str, Any], context: Mapping[str, An
     """Merge whitelisted keys from ``body.context`` into both ``config['configurable']``
     and ``config['context']`` so they are visible to legacy configurable readers and
     to LangGraph ``ToolRuntime.context`` consumers (e.g. the ``setup_agent`` tool —
-    see issue #2677).
-
-    ``user_id`` is intentionally propagated into ``config['context']`` in addition to
-    the whitelisted keys, so non-web callers (e.g. IM channels) that supply identity in
-    ``body.context`` keep it on ``ToolRuntime.context``. It is merged with
-    ``setdefault`` so a server-authenticated id stamped by
-    :func:`inject_authenticated_user_context` always wins over the client-supplied one.
-    """
+    see issue #2677)."""
     if not context:
         return
     configurable = config.setdefault("configurable", {})
@@ -159,8 +152,6 @@ def merge_run_context_overrides(config: dict[str, Any], context: Mapping[str, An
                 configurable.setdefault(key, context[key])
             if isinstance(runtime_context, dict):
                 runtime_context.setdefault(key, context[key])
-    if "user_id" in context and isinstance(runtime_context, dict):
-        runtime_context.setdefault("user_id", context["user_id"])
 
 
 def inject_authenticated_user_context(config: dict[str, Any], request: Request) -> None:
@@ -174,9 +165,6 @@ def inject_authenticated_user_context(config: dict[str, Any], request: Request) 
     user = getattr(request.state, "user", None)
     user_id = getattr(user, "id", None)
     if user_id is None:
-        return
-
-    if getattr(user, "system_role", None) == INTERNAL_SYSTEM_ROLE:
         return
 
     runtime_context = config.setdefault("context", {})
@@ -315,21 +303,6 @@ async def start_run(
                 detail=f"Model {model_name!r} is not in the configured model allowlist",
             )
 
-    # Stateless run endpoints carry thread_id in the request *body*, so the
-    # @require_permission(owner_check=True) decorator -- which resolves ownership
-    # from the path param -- cannot protect them. Enforce thread ownership here,
-    # before any run is created, so one user cannot start runs on (or read /wait
-    # checkpoint state from) another user's thread. Missing rows (auto-created
-    # temp threads) and NULL-owner rows (shared / pre-auth data) stay accessible
-    # via check_access; only a thread already owned by another user is rejected
-    # with 404, matching thread_runs.py's anti-enumeration behaviour. Internal
-    # channel runs act on behalf of IM users they do not own (see
-    # inject_authenticated_user_context), so the internal system role is exempt.
-    user = getattr(request.state, "user", None)
-    if user is not None and getattr(user, "system_role", None) != INTERNAL_SYSTEM_ROLE:
-        if not await run_ctx.thread_store.check_access(thread_id, str(user.id)):
-            raise HTTPException(status_code=404, detail=f"Thread {thread_id} not found")
-
     try:
         record = await run_mgr.create_or_reject(
             thread_id,
@@ -345,51 +318,76 @@ async def start_run(
     except UnsupportedStrategyError as exc:
         raise HTTPException(status_code=501, detail=str(exc)) from exc
 
-    # Upsert thread metadata so the thread appears in /threads/search,
-    # even for threads that were never explicitly created via POST /threads
-    # (e.g. stateless runs).
-    try:
-        existing = await run_ctx.thread_store.get(thread_id)
-        if existing is None:
-            await run_ctx.thread_store.create(
-                thread_id,
-                assistant_id=body.assistant_id,
-                metadata=body.metadata,
-            )
-        else:
-            await run_ctx.thread_store.update_status(thread_id, "running")
-    except Exception:
-        logger.warning("Failed to upsert thread_meta for %s (non-fatal)", sanitize_log_param(thread_id))
-
-    agent_factory = resolve_agent_factory(body.assistant_id)
-    graph_input = normalize_input(body.input)
-    config = build_run_config(thread_id, body.config, body.metadata, assistant_id=body.assistant_id)
-
-    # Merge DeerFlow-specific context overrides into both ``configurable`` and ``context``.
-    # The ``context`` field is a custom extension for the langgraph-compat layer
-    # that carries agent configuration (model_name, thinking_enabled, etc.).
-    # Only agent-relevant keys are forwarded; unknown keys (e.g. thread_id) are ignored.
-    merge_run_context_overrides(config, getattr(body, "context", None))
-    inject_authenticated_user_context(config, request)
-
-    stream_modes = normalize_stream_modes(body.stream_mode)
-
-    task = asyncio.create_task(
-        run_agent(
-            bridge,
-            run_mgr,
-            record,
-            ctx=run_ctx,
-            agent_factory=agent_factory,
-            graph_input=graph_input,
-            config=config,
-            stream_modes=stream_modes,
-            stream_subgraphs=body.stream_subgraphs,
-            interrupt_before=body.interrupt_before,
-            interrupt_after=body.interrupt_after,
+    # Acquire global concurrency slot before creating the background task.
+    # This rejects excess runs immediately with a clear error instead of
+    # letting the event loop saturate under unbounded concurrent tasks.
+    acquired = await run_mgr.acquire_concurrency_slot(record.run_id)
+    if not acquired:
+        # Roll back the in-memory record we just created.
+        await run_mgr.cleanup(record.run_id, delay=0)
+        raise HTTPException(
+            status_code=503,
+            detail="Server is currently at capacity for background runs. Please retry in a moment.",
+            headers={"Retry-After": "5"},
         )
-    )
-    record.task = task
+
+    # Everything between acquire and create_task must be wrapped in a
+    # try/except so that exceptions (e.g. normalize_input raising 400 for
+    # malformed messages) release the concurrency slot.  Without this,
+    # each 400 would leak a semaphore count and eventually exhaust all
+    # slots (Problem A).
+    try:
+        # Upsert thread metadata so the thread appears in /threads/search,
+        # even for threads that were never explicitly created via POST /threads
+        # (e.g. stateless runs).
+        try:
+            existing = await run_ctx.thread_store.get(thread_id)
+            if existing is None:
+                await run_ctx.thread_store.create(
+                    thread_id,
+                    assistant_id=body.assistant_id,
+                    metadata=body.metadata,
+                )
+            else:
+                await run_ctx.thread_store.update_status(thread_id, "running")
+        except Exception:
+            logger.warning("Failed to upsert thread_meta for %s (non-fatal)", sanitize_log_param(thread_id))
+
+        agent_factory = resolve_agent_factory(body.assistant_id)
+        graph_input = normalize_input(body.input)
+        config = build_run_config(thread_id, body.config, body.metadata, assistant_id=body.assistant_id)
+
+        # Merge DeerFlow-specific context overrides into both ``configurable`` and ``context``.
+        # The ``context`` field is a custom extension for the langgraph-compat layer
+        # that carries agent configuration (model_name, thinking_enabled, etc.).
+        # Only agent-relevant keys are forwarded; unknown keys (e.g. thread_id) are ignored.
+        merge_run_context_overrides(config, getattr(body, "context", None))
+        inject_authenticated_user_context(config, request)
+
+        stream_modes = normalize_stream_modes(body.stream_mode)
+
+        task = asyncio.create_task(
+            run_agent(
+                bridge,
+                run_mgr,
+                record,
+                ctx=run_ctx,
+                agent_factory=agent_factory,
+                graph_input=graph_input,
+                config=config,
+                stream_modes=stream_modes,
+                stream_subgraphs=body.stream_subgraphs,
+                interrupt_before=body.interrupt_before,
+                interrupt_after=body.interrupt_after,
+            )
+        )
+        record.task = task
+    except BaseException:
+        # Release the slot on any failure between acquire and task creation.
+        # CancelledError and other BaseException subclasses must also release —
+        # otherwise a cancellation during process shutdown would leak the slot.
+        run_mgr.release_concurrency_slot(record.run_id)
+        raise
 
     # Title sync is handled by worker.py's finally block which reads the
     # title from the checkpoint and calls thread_store.update_display_name

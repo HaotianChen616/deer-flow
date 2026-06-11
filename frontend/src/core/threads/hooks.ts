@@ -3,8 +3,6 @@ import type { ThreadsClient } from "@langchain/langgraph-sdk/client";
 import { useStream } from "@langchain/langgraph-sdk/react";
 import {
   type QueryClient,
-  type InfiniteData,
-  useInfiniteQuery,
   useMutation,
   useQuery,
   useQueryClient,
@@ -108,30 +106,17 @@ function dedupeMessagesByIdentity(messages: Message[]): Message[] {
   });
 }
 
-export function findLatestUnloadedRunIndex(
+function findLatestUnloadedRunIndex(
   runs: Run[],
   loadedRunIds: ReadonlySet<string>,
 ): number {
-  for (let i = 0; i < runs.length; i++) {
+  for (let i = runs.length - 1; i >= 0; i--) {
     const run = runs[i];
     if (run && !loadedRunIds.has(run.run_id)) {
       return i;
     }
   }
   return -1;
-}
-
-export const MAX_CONSECUTIVE_EMPTY_RUN_LOADS = 5;
-
-export function shouldAutoContinueOnEmptyRun(
-  fetchedMessageCount: number,
-  consecutiveEmptyLoads: number,
-  maxConsecutiveEmptyLoads: number = MAX_CONSECUTIVE_EMPTY_RUN_LOADS,
-): boolean {
-  return (
-    fetchedMessageCount === 0 &&
-    consecutiveEmptyLoads < maxConsecutiveEmptyLoads
-  );
 }
 
 type RunMessagesPageResponse = {
@@ -313,56 +298,6 @@ export function upsertThreadInSearchCache(
   );
 }
 
-export function upsertThreadInInfiniteCache(
-  queryClient: QueryClient,
-  thread: AgentThread,
-) {
-  queryClient.setQueriesData(
-    {
-      queryKey: INFINITE_THREADS_QUERY_KEY_PREFIX,
-      exact: false,
-    },
-    (oldData: InfiniteData<AgentThread[]> | undefined) => {
-      if (!oldData) {
-        return oldData;
-      }
-
-      const merged = oldData.pages.map((page) =>
-        page.map((t) =>
-          t.thread_id === thread.thread_id
-            ? {
-                ...thread,
-                ...t,
-                metadata: {
-                  ...(thread.metadata ?? {}),
-                  ...(t.metadata ?? {}),
-                },
-                values: {
-                  ...thread.values,
-                  ...t.values,
-                },
-              }
-            : t,
-        ),
-      );
-
-      const exists = merged.some((page) =>
-        page.some((t) => t.thread_id === thread.thread_id),
-      );
-      if (exists) {
-        return { ...oldData, pages: merged };
-      }
-
-      const firstPage = merged[0] ?? [];
-      const restPages = merged.slice(1);
-      return {
-        ...oldData,
-        pages: [[thread, ...firstPage], ...restPages],
-      };
-    },
-  );
-}
-
 function getStreamErrorMessage(error: unknown): string {
   if (typeof error === "string" && error.trim()) {
     return error;
@@ -381,6 +316,27 @@ function getStreamErrorMessage(error: unknown): string {
     }
     if (typeof nestedError === "string" && nestedError.trim()) {
       return nestedError;
+    }
+    // LangGraph SDK wraps HTTP error bodies in various shapes.
+    // FastAPI returns {"detail": "..."} for HTTPException; the SDK may
+    // surface it as error.detail, error.body.detail, or error.response.detail.
+    const detail = Reflect.get(error, "detail");
+    if (typeof detail === "string" && detail.trim()) {
+      return detail;
+    }
+    const body = Reflect.get(error, "body");
+    if (typeof body === "object" && body !== null) {
+      const bodyDetail = Reflect.get(body, "detail");
+      if (typeof bodyDetail === "string" && bodyDetail.trim()) {
+        return bodyDetail;
+      }
+    }
+    const response = Reflect.get(error, "response");
+    if (typeof response === "object" && response !== null) {
+      const respDetail = Reflect.get(response, "detail");
+      if (typeof respDetail === "string" && respDetail.trim()) {
+        return respDetail;
+      }
     }
   }
   return "Request failed.";
@@ -416,7 +372,7 @@ export function useThreadStream({
     loadMore: loadMoreHistory,
     loading: isHistoryLoading,
     appendMessages,
-  } = useThreadHistory(onStreamThreadId ?? "", { enabled: !isMock });
+  } = useThreadHistory(onStreamThreadId ?? "");
 
   // Keep listeners ref updated with latest callbacks
   useEffect(() => {
@@ -457,19 +413,6 @@ export function useThreadStream({
       handleStreamStart(meta.thread_id, meta.run_id);
       const now = new Date().toISOString();
       upsertThreadInSearchCache(queryClient, {
-        thread_id: meta.thread_id,
-        created_at: now,
-        updated_at: now,
-        metadata: context.agent_name ? { agent_name: context.agent_name } : {},
-        status: "busy",
-        values: {
-          title: t.pages.newChat,
-          messages: [],
-          artifacts: [],
-        },
-        interrupts: {},
-      });
-      upsertThreadInInfiniteCache(queryClient, {
         thread_id: meta.thread_id,
         created_at: now,
         updated_at: now,
@@ -553,27 +496,6 @@ export function useThreadStream({
               });
             },
           );
-          const nextTitle: string = update.title;
-          void queryClient.setQueriesData(
-            {
-              queryKey: INFINITE_THREADS_QUERY_KEY_PREFIX,
-              exact: false,
-            },
-            (oldData: InfiniteData<AgentThread[]> | undefined) =>
-              mapInfiniteThreadsCache(
-                oldData,
-                (t): AgentThread =>
-                  t.thread_id === threadIdRef.current
-                    ? {
-                        ...t,
-                        values: {
-                          ...t.values,
-                          title: nextTitle,
-                        },
-                      }
-                    : t,
-              ),
-          );
         }
       }
     },
@@ -628,9 +550,6 @@ export function useThreadStream({
           .filter((id): id is string => Boolean(id)),
       );
       void queryClient.invalidateQueries({ queryKey: ["threads", "search"] });
-      void queryClient.invalidateQueries({
-        queryKey: INFINITE_THREADS_QUERY_KEY_PREFIX,
-      });
       if (threadIdRef.current && !isMock) {
         void queryClient.invalidateQueries({
           queryKey: threadTokenUsageQueryKey(threadIdRef.current),
@@ -890,9 +809,6 @@ export function useThreadStream({
           },
         );
         void queryClient.invalidateQueries({ queryKey: ["threads", "search"] });
-        void queryClient.invalidateQueries({
-          queryKey: INFINITE_THREADS_QUERY_KEY_PREFIX,
-        });
       } catch (error) {
         setOptimisticMessages([]);
         setIsUploading(false);
@@ -946,15 +862,8 @@ export function useThreadStream({
   } as const;
 }
 
-type ThreadHistoryOptions = {
-  enabled?: boolean;
-};
-
-export function useThreadHistory(
-  threadId: string,
-  { enabled = true }: ThreadHistoryOptions = {},
-) {
-  const runs = useThreadRuns(threadId, { enabled });
+export function useThreadHistory(threadId: string) {
+  const runs = useThreadRuns(threadId);
   const threadIdRef = useRef(threadId);
   const runsRef = useRef(runs.data ?? []);
   const indexRef = useRef(-1);
@@ -963,15 +872,10 @@ export function useThreadHistory(
   const loadingRunIdRef = useRef<string | null>(null);
   const loadedRunIdsRef = useRef<Set<string>>(new Set());
   const runBeforeSeqRef = useRef<Map<string, number>>(new Map());
-  const loadGenerationRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
 
   const loadMessages = useCallback(async () => {
-    if (!enabled) {
-      return;
-    }
-    const loadGeneration = loadGenerationRef.current;
     if (loadingRef.current) {
       const pendingRunIndex = findLatestUnloadedRunIndex(
         runsRef.current,
@@ -991,7 +895,6 @@ export function useThreadHistory(
     setLoading(true);
 
     try {
-      let consecutiveEmptyLoads = 0;
       do {
         pendingLoadRef.current = false;
 
@@ -1025,15 +928,12 @@ export function useThreadHistory(
         }).then((res) => {
           return res.json();
         });
-        if (
-          loadGenerationRef.current !== loadGeneration ||
-          threadIdRef.current !== requestThreadId
-        ) {
-          return;
-        }
         const _messages = result.data
           .filter((m) => !m.metadata.caller?.startsWith("middleware:"))
           .map((m) => m.content);
+        if (threadIdRef.current !== requestThreadId) {
+          return;
+        }
         setMessages((prev) =>
           dedupeMessagesByIdentity([..._messages, ...prev]),
         );
@@ -1048,17 +948,6 @@ export function useThreadHistory(
         } else {
           runBeforeSeqRef.current.delete(run.run_id);
           loadedRunIdsRef.current.add(run.run_id);
-          if (
-            shouldAutoContinueOnEmptyRun(
-              _messages.length,
-              consecutiveEmptyLoads,
-            )
-          ) {
-            consecutiveEmptyLoads += 1;
-            pendingLoadRef.current = true;
-          } else {
-            consecutiveEmptyLoads = 0;
-          }
         }
         indexRef.current = findLatestUnloadedRunIndex(
           runsRef.current,
@@ -1068,19 +957,16 @@ export function useThreadHistory(
     } catch (err) {
       console.error(err);
     } finally {
-      if (loadGenerationRef.current === loadGeneration) {
-        loadingRef.current = false;
-        loadingRunIdRef.current = null;
-        setLoading(false);
-      }
+      loadingRef.current = false;
+      loadingRunIdRef.current = null;
+      setLoading(false);
     }
-  }, [enabled]);
+  }, []);
   useEffect(() => {
     const threadChanged = threadIdRef.current !== threadId;
     threadIdRef.current = threadId;
 
-    if (!enabled || threadChanged) {
-      loadGenerationRef.current += 1;
+    if (threadChanged) {
       runsRef.current = [];
       indexRef.current = -1;
       pendingLoadRef.current = false;
@@ -1090,10 +976,6 @@ export function useThreadHistory(
       loadingRef.current = false;
       setLoading(false);
       setMessages([]);
-    }
-
-    if (!enabled) {
-      return;
     }
 
     if (runs.data && runs.data.length > 0) {
@@ -1106,15 +988,14 @@ export function useThreadHistory(
     loadMessages().catch(() => {
       toast.error("Failed to load thread history.");
     });
-  }, [enabled, threadId, runs.data, loadMessages]);
+  }, [threadId, runs.data, loadMessages]);
 
   const appendMessages = useCallback((_messages: Message[]) => {
     setMessages((prev) => {
       return dedupeMessagesByIdentity([...prev, ..._messages]);
     });
   }, []);
-  const hasMore =
-    enabled && Boolean(threadId) && (indexRef.current >= 0 || !runs.data);
+  const hasMore = indexRef.current >= 0 || !runs.data;
   return {
     runs: runs.data,
     messages,
@@ -1192,90 +1073,7 @@ export function useThreads(
   });
 }
 
-export const INFINITE_THREADS_PAGE_SIZE = 50;
-
-export const INFINITE_THREADS_QUERY_KEY_PREFIX = [
-  "threads",
-  "searchInfinite",
-] as const;
-
-type InfiniteThreadsParams = Omit<
-  Parameters<ThreadsClient["search"]>[0],
-  "limit" | "offset"
->;
-
-export function getInfiniteThreadsNextPageParam(
-  lastPage: AgentThread[],
-  allPages: AgentThread[][],
-  pageSize: number = INFINITE_THREADS_PAGE_SIZE,
-): number | undefined {
-  if (lastPage.length < pageSize) {
-    return undefined;
-  }
-  return allPages.reduce((sum, page) => sum + page.length, 0);
-}
-
-export function mapInfiniteThreadsCache(
-  oldData: InfiniteData<AgentThread[]> | undefined,
-  mapper: (thread: AgentThread) => AgentThread,
-): InfiniteData<AgentThread[]> | undefined {
-  if (!oldData) {
-    return oldData;
-  }
-  return {
-    ...oldData,
-    pages: oldData.pages.map((page) => page.map(mapper)),
-  };
-}
-
-export function filterInfiniteThreadsCache(
-  oldData: InfiniteData<AgentThread[]> | undefined,
-  predicate: (thread: AgentThread) => boolean,
-): InfiniteData<AgentThread[]> | undefined {
-  if (!oldData) {
-    return oldData;
-  }
-  return {
-    ...oldData,
-    pages: oldData.pages.map((page) => page.filter(predicate)),
-  };
-}
-
-export function useInfiniteThreads(
-  params: InfiniteThreadsParams = {
-    sortBy: "updated_at",
-    sortOrder: "desc",
-    select: ["thread_id", "updated_at", "values", "metadata"],
-  },
-) {
-  const apiClient = getAPIClient();
-  return useInfiniteQuery<
-    AgentThread[],
-    Error,
-    InfiniteData<AgentThread[]>,
-    readonly unknown[],
-    number
-  >({
-    queryKey: [...INFINITE_THREADS_QUERY_KEY_PREFIX, params],
-    initialPageParam: 0,
-    queryFn: async ({ pageParam }) => {
-      const response = (await apiClient.threads.search<AgentThreadState>({
-        ...params,
-        limit: INFINITE_THREADS_PAGE_SIZE,
-        offset: pageParam,
-      })) as AgentThread[];
-      return response;
-    },
-    getNextPageParam: (lastPage, allPages) =>
-      getInfiniteThreadsNextPageParam(lastPage, allPages),
-    refetchOnWindowFocus: false,
-  });
-}
-
-export function useThreadRuns(
-  threadId?: string,
-  { enabled = true }: { enabled?: boolean } = {},
-) {
+export function useThreadRuns(threadId?: string) {
   const apiClient = getAPIClient();
   return useQuery<Run[]>({
     queryKey: ["thread", threadId],
@@ -1286,7 +1084,6 @@ export function useThreadRuns(
       const response = await apiClient.runs.list(threadId);
       return response;
     },
-    enabled: enabled && Boolean(threadId),
     refetchOnWindowFocus: false,
   });
 }
@@ -1355,21 +1152,9 @@ export function useDeleteThread() {
           return oldData.filter((t) => t.thread_id !== threadId);
         },
       );
-      queryClient.setQueriesData(
-        {
-          queryKey: INFINITE_THREADS_QUERY_KEY_PREFIX,
-          exact: false,
-        },
-        (oldData: InfiniteData<AgentThread[]> | undefined) =>
-          filterInfiniteThreadsCache(oldData, (t) => t.thread_id !== threadId),
-      );
     },
-
     onSettled() {
       void queryClient.invalidateQueries({ queryKey: ["threads", "search"] });
-      void queryClient.invalidateQueries({
-        queryKey: INFINITE_THREADS_QUERY_KEY_PREFIX,
-      });
     },
   });
 }
@@ -1409,24 +1194,6 @@ export function useRenameThread() {
             return t;
           });
         },
-      );
-      queryClient.setQueriesData(
-        {
-          queryKey: INFINITE_THREADS_QUERY_KEY_PREFIX,
-          exact: false,
-        },
-        (oldData: InfiniteData<AgentThread[]> | undefined) =>
-          mapInfiniteThreadsCache(oldData, (t) =>
-            t.thread_id === threadId
-              ? {
-                  ...t,
-                  values: {
-                    ...t.values,
-                    title,
-                  },
-                }
-              : t,
-          ),
       );
     },
   });
