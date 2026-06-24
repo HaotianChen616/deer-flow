@@ -316,7 +316,7 @@ class TestBuildPreview:
         assert "Preview kind: csv" in preview
         assert "CSV table with 2 data rows and 2 columns" in preview
         assert "columns: name, score" in preview
-        assert "first data row: Ada,98" in preview
+        assert "first data row: name=Ada | score=98" in preview
 
 
 class TestToolOutputSynopsis:

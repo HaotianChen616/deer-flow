@@ -352,6 +352,10 @@ def _try_xml(stripped: str) -> ToolOutputSynopsis | None:
     )
 
 
+_TABLE_MIN_DATA_ROWS = 5
+_TABLE_HEADER_IDENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*$")
+
+
 def _try_table(content: str, *, delimiter: str, kind: Literal["csv", "tsv"]) -> ToolOutputSynopsis | None:
     sample_text = "\n".join(content.splitlines()[:_TABLE_SAMPLE_ROWS])
     try:
@@ -364,13 +368,32 @@ def _try_table(content: str, *, delimiter: str, kind: Literal["csv", "tsv"]) -> 
         return None
 
     width = len(rows[0])
-    if any(len(row) != width for row in rows[1:10]):
+    consistent = [row for row in rows[1:11] if len(row) == width]
+    # Tab-delimited inputs see a lot of false positives (indented bash,
+    # `ls -l` listings, tree dumps). Require >= 5 same-width data rows
+    # for TSV; CSV is rare enough in practice that 2 rows is acceptable.
+    if kind == "tsv" and len(consistent) < _TABLE_MIN_DATA_ROWS:
         return None
 
-    columns = [cell.strip() or f"column_{idx + 1}" for idx, cell in enumerate(rows[0])]
+    # Header row must look like identifiers (no whitespace, no leading ws).
+    # Refuses tab-indented bash output, ls -l listings, and tree dumps that
+    # happen to be tab-delimited.
+    raw_header = rows[0]
+    if any(not _TABLE_HEADER_IDENT_RE.match(cell.strip()) for cell in raw_header):
+        return None
+    if any(cell.startswith((" ", "\t")) for cell in raw_header):
+        return None
+
+    columns = [cell.strip() or f"column_{idx + 1}" for idx, cell in enumerate(raw_header)]
     total_nonempty_lines = sum(1 for line in content.splitlines() if line.strip())
     data_rows = max(0, total_nonempty_lines - 1)
-    first_data = delimiter.join(rows[1]) if len(rows) > 1 else ""
+    # Render the first data row as a key=value list so quoted cells that
+    # contain the delimiter do not get rejoined into a comma-separated
+    # string that misleads the model about column count.
+    first_data_pairs: list[str] = []
+    if len(rows) > 1:
+        for col_name, cell in list(zip(columns, rows[1]))[:_TABLE_COLUMN_LIMIT]:
+            first_data_pairs.append(f"{col_name}={_clip(cell, 80)}")
     title = "CSV table output" if kind == "csv" else "TSV table output"
     label = kind.upper()
     return ToolOutputSynopsis(
@@ -379,24 +402,42 @@ def _try_table(content: str, *, delimiter: str, kind: Literal["csv", "tsv"]) -> 
         summary=[f"{label} table with {data_rows} data rows and {width} columns."],
         structure=[
             f"columns: {', '.join(columns[:_TABLE_COLUMN_LIMIT])}",
-            f"first data row: {_one_line(first_data, _TABLE_FIRST_ROW_CHARS) or '(none)'}",
+            f"first data row: {' | '.join(first_data_pairs) or '(none)'}",
         ],
         notable_items=[],
     )
 
 
+_YAML_KEY_LINE_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_.\-]*:\s*\S.*$")
+
+
 def _looks_yaml(content: str) -> bool:
+    """Heuristic detector for YAML-shaped content.
+
+    Returns True only when the content looks structurally like YAML
+    (a document start marker, or multiple nested key/value lines with
+    values that are not bare uppercase log prefixes). Plain logs,
+    Python tracebacks, and `key: value` lines that consist entirely
+    of uppercase tags (which YAML treats as string keys) are refused.
+    """
     stripped = content.lstrip()
     if stripped.startswith("---"):
         return True
     if _looks_code(content):
         return False
+
     key_like = 0
     for line in content.splitlines()[:80]:
-        if re.match(r"^\s*[A-Za-z0-9_.-]+:\s*(?:.+)?$", line):
-            key_like += 1
-            if key_like >= 2:
-                return True
+        if not _YAML_KEY_LINE_RE.match(line):
+            continue
+        # Reject log-style lines where the key is an uppercase tag and
+        # the value is a free-form message: e.g. "INFO: starting service".
+        key = line.split(":", 1)[0].strip()
+        if key.isupper() and "_" not in key:
+            continue
+        key_like += 1
+        if key_like >= 3:
+            return True
     return False
 
 
@@ -409,6 +450,14 @@ def _try_yaml(content: str) -> ToolOutputSynopsis | None:
         return None
     if not isinstance(value, (dict, list)):
         return None
+    # Refuse flat "all values are strings" payloads: that shape is what
+    # log lines and Python tracebacks collapse into after safe_load, and
+    # it gives the model a misleadingly small "YAML with N keys" summary
+    # for outputs that are really free-form text.
+    if isinstance(value, dict):
+        non_string_children = sum(1 for v in value.values() if not isinstance(v, str))
+        if non_string_children == 0 and len(value) > 0:
+            return None
 
     summary: list[str]
     structure: list[str] = []
@@ -488,18 +537,27 @@ def _summarize_text(content: str, *, tool_name: str = "") -> ToolOutputSynopsis:
             break
 
     opener = _one_line(content[:_TEXT_EXCERPT_CHARS], _TEXT_EXCERPT_CHARS)
-    closer = _one_line(content[-_TEXT_EXCERPT_CHARS:], _TEXT_EXCERPT_CHARS)
+    # For inputs shorter than 2 * _TEXT_EXCERPT_CHARS the original opener
+    # and closer would overlap and duplicate text. Skip the closer in that
+    # case (and also when opener already covers the entire content).
+    if len(content) <= _TEXT_EXCERPT_CHARS:
+        closer = ""
+    else:
+        close_start = max(_TEXT_EXCERPT_CHARS, len(content) - _TEXT_EXCERPT_CHARS)
+        closer = _one_line(content[close_start:], _TEXT_EXCERPT_CHARS) if close_start < len(content) else ""
     word_count = len(normalized.split()) if normalized else 0
     tool_hint = f" from {tool_name}" if tool_name else ""
+    summary_lines = [
+        f"Text output{tool_hint} with {len(content)} characters, {word_count} words, and {len(lines)} lines.",
+        f"Detected section headers: {' | '.join(headers) if headers else 'none detected'}.",
+        f"Opening excerpt: {opener or '(empty)'}",
+    ]
+    if closer:
+        summary_lines.append(f"Closing excerpt: {closer}")
     return ToolOutputSynopsis(
         kind="text",
         title="Text output",
-        summary=[
-            f"Text output{tool_hint} with {len(content)} characters, {word_count} words, and {len(lines)} lines.",
-            f"Detected section headers: {' | '.join(headers) if headers else 'none detected'}.",
-            f"Opening excerpt: {opener or '(empty)'}",
-            f"Closing excerpt: {closer or '(empty)'}",
-        ],
+        summary=summary_lines,
         structure=[],
         notable_items=[],
     )
