@@ -258,24 +258,24 @@ def _json_container_paths(value: Any, *, limit: int = _JSON_STRUCTURE_LIMIT) -> 
 def _scalar_examples(value: Any, *, path: str = "$", limit: int = _SCALAR_LIMIT) -> list[str]:
     examples: list[str] = []
 
-    def walk(node: Any, current: str) -> None:
-        if len(examples) >= limit:
+    def walk(node: Any, current: str, depth: int) -> None:
+        if len(examples) >= limit or depth >= _JSON_STRUCTURE_DEPTH:
             return
         if isinstance(node, dict):
             for key, child in list(node.items())[:_KEY_LIMIT]:
-                walk(child, f"{current}.{key}")
+                walk(child, f"{current}.{key}", depth + 1)
                 if len(examples) >= limit:
                     break
             return
         if isinstance(node, list):
             for index, child in enumerate(node[:2]):
-                walk(child, f"{current}[{index}]")
+                walk(child, f"{current}[{index}]", depth + 1)
                 if len(examples) >= limit:
                     break
             return
         examples.append(f"{current}: {_short_value(node)}")
 
-    walk(value, path)
+    walk(value, path, 0)
     return examples
 
 
