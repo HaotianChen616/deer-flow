@@ -144,7 +144,6 @@ def render_tool_output_preview(
     lines.append("")
     lines.append("Access:")
     lines.append(f"- Use read_file on {virtual_path} with start_line and end_line to inspect the raw output.")
-    lines.append("- Start near the line hints above when present; byte offsets are approximate anchors into the saved file.")
     return "\n".join(lines)
 
 

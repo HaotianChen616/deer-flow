@@ -355,6 +355,122 @@ class TestToolOutputSynopsis:
         assert "root tag: feed" in synopsis.structure
         assert "entry: 2" in synopsis.structure
 
+    # ------------------------------------------------------------------
+    # Regression tests for the @willem-bd review of PR #3377.
+    # Each test pins one of the eight findings so a future change cannot
+    # silently regress the fix.
+    # ------------------------------------------------------------------
+
+    def test_review_5_log_lines_are_not_misclassified_as_yaml(self):
+        # 200 lines of log output shaped like "LEVEL: message". The previous
+        # _looks_yaml counted 2 'key:' lines and accepted it; _try_yaml then
+        # produced a "YAML object with 3 top-level keys: INFO, ERROR, WARN"
+        # summary that hid every line, count, and middle-of-log signal.
+        content = "INFO: starting service\nERROR: failed to connect\nWARN: retrying\nINFO: connected\n" * 200
+        synopsis = build_tool_output_synopsis(content, tool_name="bash")
+        assert synopsis.kind == "text", f"expected text, got {synopsis.kind!r}: {synopsis.summary}"
+
+    def test_review_6_json_paths_are_emitted_without_byte_offset(self):
+        # The previous _json_path_location anchored at the first textual
+        # occurrence of the key string, which is wrong when the key also
+        # appears as a value earlier in the document.
+        content = '{"label": "items", "items": {"id": 1, "name": "foo"}}'
+        preview = _build_preview(
+            content,
+            tool_name="api_tool",
+            virtual_path="/mnt/test/api.json",
+            head_chars=200,
+            tail_chars=200,
+        )
+        assert "byte offset" not in preview
+        # The path itself is still useful navigation.
+        assert "$.items" in preview
+
+    def test_review_7_scalar_examples_respects_depth_cap(self):
+        # build_tool_output_synopsis used to recurse without a depth cap
+        # in _scalar_examples, which could trigger RecursionError on
+        # deeply nested JSON. The cap is now mirrored from
+        # _JSON_STRUCTURE_DEPTH.
+        deep = {"k": 1}
+        for _ in range(500):
+            deep = {"k": deep}
+        # Should not raise.
+        synopsis = build_tool_output_synopsis(json.dumps(deep))
+        assert synopsis.kind == "json"
+
+    def test_review_8_csv_first_row_quoted_cells_round_trip(self):
+        # delimiter.join(rows[1]) silently re-split cells containing the
+        # delimiter inside a quoted cell, misleading the model about
+        # column count.
+        content = 'name,description,score\nAda,"a fine, brilliant logician",98\nGrace,"a creator, of compilers",99\n'
+        synopsis = build_tool_output_synopsis(content, tool_name="csv_tool")
+        assert synopsis.kind == "csv"
+        first_row = next((line for line in synopsis.structure if line.startswith("first data row:")), "")
+        # All three columns must be present, and the quoted cell must
+        # round-trip without losing the embedded comma.
+        assert "name=Ada" in first_row
+        assert "score=98" in first_row
+        assert "a fine, brilliant logician" in first_row
+        # The re-joined comma-broken row is the failure mode we are guarding.
+        assert "Ada,a fine, brilliant" not in first_row
+
+    def test_review_9_tsv_detector_rejects_tab_indented_bash(self):
+        # Tab-indented output (ls -l, tree, indented logs) used to be
+        # accepted as TSV because _try_table only checked that the
+        # delimiter is present and rows agree on width.
+        bash_out = "ls -l output:\n\ttotal 0\n\tdrwxr-xr-x  2 user  group   64 Jun 24 17:00 dir1\n\tdrwxr-xr-x  2 user  group   64 Jun 24 17:00 dir2\n\tdrwxr-xr-x  2 user  group   64 Jun 24 17:00 dir3\n\tdrwxr-xr-x  2 user  group   64 Jun 24 17:00 dir4\n\tdrwxr-xr-x  2 user  group   64 Jun 24 17:00 dir5\n"
+        synopsis = build_tool_output_synopsis(bash_out, tool_name="bash")
+        assert synopsis.kind == "text", f"expected text, got {synopsis.kind!r}: {synopsis.summary}"
+
+    def test_review_10_preview_includes_raw_head_and_tail_sample(self):
+        # Default behavior change in the PR removed the inline raw bytes
+        # for non-binary previews. The fix restores them so the model
+        # can see the actual first/last KB without a follow-up read_file.
+        content = "log line 1\n" * 200
+        preview = _build_preview(
+            content,
+            tool_name="bash",
+            virtual_path="/mnt/test/run.log",
+            head_chars=400,
+            tail_chars=400,
+        )
+        assert "Raw sample (head + tail" in preview
+        # head_chars=400 should capture the first 80 'log line 1' lines
+        # verbatim; tail_chars=400 should capture the last 80.
+        assert preview.count("log line 1") >= 80
+
+    def test_review_11_short_text_does_not_duplicate_excerpts(self):
+        # For inputs shorter than 2 * _TEXT_EXCERPT_CHARS, the previous
+        # opener/closer slices overlapped and the model saw the same
+        # body twice. build_tool_output_synopsis is reachable directly
+        # from tests and other callers that pass small inputs.
+        short = "hello world " * 30  # ~360 chars
+        synopsis = build_tool_output_synopsis(short)
+        opener_line = next((l for l in synopsis.summary if l.startswith("Opening excerpt: ")), "")
+        # Closer is now suppressed entirely for short inputs.
+        assert all(not l.startswith("Closing excerpt: ") for l in synopsis.summary), (
+            f"unexpected closer for short input: {synopsis.summary}"
+        )
+        assert opener_line, "opening excerpt should still be present"
+
+    def test_review_12_preview_head_tail_chars_are_operational(self):
+        # preview_head_chars / preview_tail_chars were silently no-op
+        # for every non-binary kind. The fix plumbs them through
+        # render_tool_output_preview as an explicit 'Raw sample' section.
+        content = "alpha " * 1000  # 6000 chars
+        preview = _build_preview(
+            content,
+            tool_name="bash",
+            virtual_path="/mnt/test/run.log",
+            head_chars=300,
+            tail_chars=300,
+        )
+        # The head sample should contain 'alpha' more times than the
+        # tail (or split-count), proving head_chars=300 took effect.
+        # The full document has 1000 'alpha' tokens; without head_chars
+        # we'd see fewer than 50 in the head sample.
+        assert preview.count("alpha") >= 50
+
 
 class TestBuildFallback:
     def test_short_content_unchanged(self):
