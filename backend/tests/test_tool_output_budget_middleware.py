@@ -289,11 +289,13 @@ class TestBuildPreview:
         )
         assert "$.data: object keys 2; keys items, next_cursor" in preview
         assert "$.data.items: array length 47; first item object" in preview
-        assert "line " in preview
-        assert "byte offset " in preview
-        assert "Start near the line hints above" in preview
+        # Location hints were removed: they are wrong when a key string also
+        # appears as a value earlier in the document, or when the same key
+        # recurs at multiple depths.
+        assert "line " not in preview.split("Access:")[0]
+        assert "byte offset " not in preview
 
-    def test_json_line_hints_use_original_content_offsets(self):
+    def test_json_paths_are_emitted_without_line_hints(self):
         content = "\n\n" + json.dumps({"data": {"items": [1, 2, 3]}}, indent=2)
         preview = _build_preview(
             content,
@@ -302,7 +304,9 @@ class TestBuildPreview:
             head_chars=80,
             tail_chars=40,
         )
-        assert "$.data: object keys 1; keys items (line 4," in preview
+        assert "$.data: object keys 1; keys items" in preview
+        assert "line " not in preview.split("Access:")[0]
+        assert "byte offset " not in preview
 
     def test_table_preview_extracts_columns(self):
         content = "name,score\nAda,98\nGrace,99\n"

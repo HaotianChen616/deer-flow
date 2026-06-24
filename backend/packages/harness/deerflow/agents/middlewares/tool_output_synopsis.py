@@ -222,51 +222,36 @@ def _json_container_description(value: Any) -> str:
     return _type_name(value)
 
 
-def _json_path_location(content: str, key_parts: list[Any]) -> str:
-    """Return an approximate source location for a JSON object path."""
-    if not key_parts:
-        return ""
+def _json_container_paths(value: Any, *, limit: int = _JSON_STRUCTURE_LIMIT) -> list[str]:
+    """Summarize nested JSON container paths.
 
-    search_from = 0
-    pos = -1
-    for key in key_parts:
-        quoted = json.dumps(str(key), ensure_ascii=False)
-        pos = content.find(quoted, search_from)
-        if pos < 0:
-            return ""
-        search_from = pos + len(quoted)
-
-    line = content.count("\n", 0, pos) + 1
-    byte_offset = len(content[:pos].encode("utf-8"))
-    return f" (line {line}, byte offset {byte_offset})"
-
-
-def _json_container_paths(content: str, value: Any, *, limit: int = _JSON_STRUCTURE_LIMIT) -> list[str]:
-    """Summarize nested JSON container paths with approximate locations."""
+    Locations are intentionally omitted: an approximate '(line N, byte
+    offset M)' anchor based on string search is wrong whenever a key
+    string also appears as a value earlier in the document, or when
+    the same key occurs at multiple depths. The path itself is already
+    useful navigation; the agent uses read_file with start_line from
+    its own judgement of where the relevant slice is.
+    """
     paths: list[str] = []
 
-    def walk(node: Any, current_path: str, key_parts: list[Any], depth: int) -> None:
+    def walk(node: Any, current_path: str, depth: int) -> None:
         if len(paths) >= limit or depth >= _JSON_STRUCTURE_DEPTH:
             return
         if isinstance(node, dict):
             for key, child in list(node.items())[:_KEY_LIMIT]:
                 if len(paths) >= limit:
                     break
-                next_parts = [*key_parts, key]
                 next_path = _json_path(current_path, key)
                 if isinstance(child, (dict, list)):
-                    paths.append(
-                        f"{next_path}: {_json_container_description(child)}"
-                        f"{_json_path_location(content, next_parts)}"
-                    )
-                    walk(child, next_path, next_parts, depth + 1)
+                    paths.append(f"{next_path}: {_json_container_description(child)}")
+                    walk(child, next_path, depth + 1)
             return
         if isinstance(node, list) and node:
             first = node[0]
             if isinstance(first, (dict, list)):
-                walk(first, f"{current_path}[]", key_parts, depth + 1)
+                walk(first, f"{current_path}[]", depth + 1)
 
-    walk(value, "$", [], 0)
+    walk(value, "$", 0)
     return paths
 
 
@@ -307,7 +292,7 @@ def _try_json(content: str) -> ToolOutputSynopsis | None:
     trailing = len(stripped[end:].strip())
     summary: list[str] = []
     structure: list[str] = [f"shape: {_json_shape(value)}"]
-    structure.extend(_json_container_paths(content, value))
+    structure.extend(_json_container_paths(value))
     notable = _scalar_examples(value)
     if isinstance(value, dict):
         keys = [str(key) for key in value.keys()]
