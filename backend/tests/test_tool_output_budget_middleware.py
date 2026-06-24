@@ -249,7 +249,7 @@ class TestBuildPreview:
         )
         assert "10000 chars" in preview
 
-    def test_json_preview_extracts_structure_instead_of_head_tail(self):
+    def test_json_preview_includes_structure_and_raw_sample(self):
         content = (
             '{"meta":{"source":"unit"},"items":[{"id":1,"name":"alpha"},{"id":2,"name":"beta"}],'
             '"payload":"' + "x" * 5000 + '","tail_marker":"SHOULD_NOT_NEED_TAIL"}'
@@ -267,7 +267,13 @@ class TestBuildPreview:
         assert "items: array length 2" in preview
         assert "$.meta.source: \"unit\"" in preview
         assert not preview.startswith('{"meta"')
-        assert "SHOULD_NOT_NEED_TAIL" not in preview
+        # The synopsis no longer hides the raw head/tail bytes; the model
+        # gets the typed synopsis AND inline raw samples so it can read
+        # the file with a tighter start_line range.
+        assert "Raw sample (head + tail" in preview
+        # payload segment dominates the document, so even with head_chars=80
+        # the raw head sample is almost entirely 'x' characters.
+        assert preview.count("x") >= 50
 
     def test_json_preview_reports_nested_paths_and_line_hints(self):
         content = json.dumps(

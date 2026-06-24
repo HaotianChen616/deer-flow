@@ -104,10 +104,19 @@ def render_tool_output_preview(
     head_chars: int,
     tail_chars: int,
 ) -> str:
-    """Render a file-backed preview as a typed synopsis plus access hint."""
+    """Render a file-backed preview as a typed synopsis plus a raw head/tail sample.
+
+    The synopsis is the primary signal; the raw sample restores the
+    inline head/tail bytes that operators used to get from
+    preview_head_chars / preview_tail_chars before the synopsis was
+    added. For binary-like output the synopsis already carries a raw
+    sample; for everything else we slice head_chars from the start and
+    tail_chars from the end of *content*.
+    """
     total = len(content)
     synopsis = build_tool_output_synopsis(content, tool_name=tool_name)
-    sample_budget = max(0, head_chars) + max(0, tail_chars)
+    head_budget = max(0, head_chars)
+    tail_budget = max(0, tail_chars)
     lines = [
         f"[Full {tool_name} output saved to {virtual_path} ({total} chars, ~{total // 4} tokens).]",
         f"[Preview kind: {synopsis.kind}. This is a structured synopsis, not a raw head/tail truncation.]",
@@ -126,11 +135,11 @@ def render_tool_output_preview(
         lines.append("Notable items:")
         lines.extend(f"- {item}" for item in synopsis.notable_items)
 
-    sample = synopsis.sample
-    if sample:
+    raw_sample = _build_raw_sample(content, head_budget=head_budget, tail_budget=tail_budget, existing=synopsis.sample)
+    if raw_sample:
         lines.append("")
-        lines.append("Sample:")
-        lines.append(_clip(sample, sample_budget) if sample_budget else sample)
+        lines.append("Raw sample (head + tail, clipped to head_chars / tail_chars):")
+        lines.append(raw_sample)
 
     lines.append("")
     lines.append("Access:")
@@ -145,6 +154,30 @@ def _clip(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: max(0, limit - 3)] + "..."
+
+
+def _build_raw_sample(content: str, *, head_budget: int, tail_budget: int, existing: str) -> str:
+    """Compose the inline head/tail raw sample.
+
+    If the synopsis already provides a sample (binary-like output), use
+    it directly. Otherwise slice head_budget bytes from the start and
+    tail_budget bytes from the end, avoiding duplicate bytes when the
+    two slices would overlap.
+    """
+    if existing:
+        return existing
+    if head_budget <= 0 and tail_budget <= 0:
+        return ""
+    if len(content) <= head_budget + tail_budget:
+        return content
+    parts: list[str] = []
+    if head_budget > 0:
+        parts.append(content[:head_budget])
+    if tail_budget > 0 and head_budget + tail_budget < len(content):
+        parts.append(content[-tail_budget:])
+    if len(parts) == 2:
+        return f"{parts[0]}\n...\n{parts[1]}"
+    return parts[0]
 
 
 def _one_line(value: str, limit: int) -> str:
