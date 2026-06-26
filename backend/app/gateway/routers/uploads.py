@@ -39,13 +39,37 @@ DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024
 DEFAULT_MAX_TOTAL_SIZE = 100 * 1024 * 1024
 
 
+class UploadedFileInfo(BaseModel):
+    """Uploaded file metadata exposed by upload and list APIs."""
+
+    filename: str
+    size: int
+    path: str
+    virtual_path: str
+    artifact_url: str
+    extension: str | None = None
+    modified: float | None = None
+    original_filename: str | None = None
+    markdown_file: str | None = None
+    markdown_path: str | None = None
+    markdown_virtual_path: str | None = None
+    markdown_artifact_url: str | None = None
+
+
 class UploadResponse(BaseModel):
     """Response model for file upload."""
 
     success: bool
-    files: list[dict[str, str]]
+    files: list[UploadedFileInfo]
     message: str
     skipped_files: list[str] = Field(default_factory=list)
+
+
+class UploadListResponse(BaseModel):
+    """Response model for uploaded file listing."""
+
+    files: list[UploadedFileInfo]
+    count: int
 
 
 class UploadLimits(BaseModel):
@@ -203,10 +227,11 @@ async def upload_files(
         raise HTTPException(status_code=413, detail=f"Too many files: maximum is {limits.max_files}")
 
     try:
-        uploads_dir = ensure_uploads_dir(thread_id)
+        effective_user_id = get_effective_user_id()
+        uploads_dir = ensure_uploads_dir(thread_id, user_id=effective_user_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    sandbox_uploads = get_paths().sandbox_uploads_dir(thread_id, user_id=get_effective_user_id())
+    sandbox_uploads = get_paths().sandbox_uploads_dir(thread_id, user_id=effective_user_id)
     uploaded_files = []
     written_paths = []
     sandbox_sync_targets = []
@@ -221,7 +246,7 @@ async def upload_files(
     sync_to_sandbox = not _uses_thread_data_mounts(sandbox_provider)
     sandbox = None
     if sync_to_sandbox:
-        sandbox_id = sandbox_provider.acquire(thread_id)
+        sandbox_id = sandbox_provider.acquire(thread_id, user_id=effective_user_id)
         sandbox = sandbox_provider.get(sandbox_id)
         if sandbox is None:
             raise HTTPException(status_code=500, detail="Failed to acquire sandbox")
@@ -256,7 +281,7 @@ async def upload_files(
 
             file_info = {
                 "filename": safe_filename,
-                "size": str(file_size),
+                "size": file_size,
                 "path": str(sandbox_uploads / safe_filename),
                 "virtual_path": virtual_path,
                 "artifact_url": upload_artifact_url(thread_id, safe_filename),
@@ -333,9 +358,9 @@ async def get_upload_limits(
     return _get_upload_limits(config)
 
 
-@router.get("/list", response_model=dict)
+@router.get("/list", response_model=UploadListResponse)
 @require_permission("threads", "read", owner_check=True)
-async def list_uploaded_files(thread_id: str, request: Request) -> dict:
+async def list_uploaded_files(thread_id: str, request: Request) -> UploadListResponse:
     """List all files in a thread's uploads directory."""
     try:
         uploads_dir = get_uploads_dir(thread_id)
@@ -349,7 +374,7 @@ async def list_uploaded_files(thread_id: str, request: Request) -> dict:
     for f in result["files"]:
         f["path"] = str(sandbox_uploads / f["filename"])
 
-    return result
+    return UploadListResponse(**result)
 
 
 @router.delete("/{filename}")
